@@ -68,6 +68,8 @@ class MethodBuilder:
         # Exception table: either ("lbl", s, e, h, catch) or
         # ("raw", s, e, h, catch).
         self.exception_table = []
+        # StackMapTable frames (see FRAME_* helpers); None = no attribute.
+        self.stack_map_frames = None
         self.max_stack = 8
         self.max_locals = 8
         self._ph = []  # (emitted_pos, width 2|4, label)
@@ -85,6 +87,14 @@ class MethodBuilder:
         ci = self.cp.class_(catch_class) if catch_class else 0
         self.exception_table.append(
             ("raw", start_pc, end_pc, handler_pc, ci))
+
+    def stack_map(self, frames):
+        """Attach a StackMapTable; frames use the FRAME_* helpers below.
+
+        Frame offsets are absolute pcs here; they are converted to
+        offset_deltas when the attribute is rendered.
+        """
+        self.stack_map_frames = frames
 
     def emit(self, data):
         if isinstance(data, int):
@@ -237,6 +247,17 @@ class ClassBuilder:
         this_idx = self.cp.class_(self.name)
         super_idx = self.cp.class_(self.super_name)
         code_name = self.cp.utf8("Code")
+        # Render method attribute bodies up front: they may allocate
+        # constant-pool entries, which must exist before the pool renders.
+        smt_name = None
+        smt_bodies = {}
+        for m in self.methods:
+            m.patch()
+            if m.stack_map_frames is not None:
+                if smt_name is None:
+                    smt_name = self.cp.utf8("StackMapTable")
+                smt_bodies[id(m)] = _render_stack_map(
+                    self.cp, m.stack_map_frames)
 
         out = struct.pack(">I", 0xCAFEBABE)
         out += struct.pack(">HH", self.minor, self.major)
@@ -246,8 +267,8 @@ class ClassBuilder:
         out += struct.pack(">H", 0)       # fields
         out += struct.pack(">H", len(self.methods))
         for m in self.methods:
-            m.patch()
-            code_attr = self._code_attr(m)
+            code_attr = self._code_attr(
+                m, smt_name, smt_bodies.get(id(m)))
             out += struct.pack(">HHH", m.access,
                                self.cp.utf8(m.name),
                                self.cp.utf8(m.descriptor))
@@ -258,7 +279,7 @@ class ClassBuilder:
         out += struct.pack(">H", 0)       # class attributes
         return bytes(out)
 
-    def _code_attr(self, m):
+    def _code_attr(self, m, smt_name=None, smt_body=None):
         out = struct.pack(">HHI", m.max_stack, m.max_locals, len(m.code))
         out += bytes(m.code)
         out += struct.pack(">H", len(m.exception_table))
@@ -268,5 +289,191 @@ class ClassBuilder:
             else:
                 sp, ep, hp = sl, el, hl
             out += struct.pack(">HHHH", sp, ep, hp, catch_idx)
-        out += struct.pack(">H", 0)
+        attrs = b""
+        attr_count = 0
+        if smt_body is not None:
+            attrs += struct.pack(">HI", smt_name, len(smt_body)) + smt_body
+            attr_count += 1
+        out += struct.pack(">H", attr_count) + attrs
         return out
+
+
+# ---------------------------------------------------------------------------
+# StackMapTable construction helpers
+# ---------------------------------------------------------------------------
+#
+# Verification types mirror the tuples decoded by app.classfile:
+#   VT_TOP/VT_INT/VT_FLOAT/VT_DOUBLE/VT_LONG/VT_NULL/VT_UNINIT_THIS,
+#   VT_OBJECT(name), VT_UNINIT(offset). VT_OBJECT_IDX emits a raw constant
+#   pool index without resolving it (for negative tests).
+
+VT_TOP = ("top",)
+VT_INT = ("int",)
+VT_FLOAT = ("float",)
+VT_DOUBLE = ("double",)
+VT_LONG = ("long",)
+VT_NULL = ("null",)
+VT_UNINIT_THIS = ("uninit_this",)
+
+
+def VT_OBJECT(name):
+    return ("object", name)
+
+
+def VT_OBJECT_IDX(index):
+    return ("object_idx", index)
+
+
+def VT_UNINIT(offset):
+    return ("uninit", offset)
+
+
+# Frame helpers take absolute pcs; deltas are computed at render time.
+def FRAME_SAME(offset):
+    return ("same", offset)
+
+
+def FRAME_SAME_1(offset, vtype):
+    return ("same_1", offset, vtype)
+
+
+def FRAME_SAME_1_EXT(offset, vtype):
+    return ("same_1x", offset, vtype)
+
+
+def FRAME_CHOP(offset, count):
+    return ("chop", offset, count)
+
+
+def FRAME_SAME_EXT(offset):
+    return ("same_x", offset)
+
+
+def FRAME_APPEND(offset, vtypes):
+    return ("append", offset, list(vtypes))
+
+
+def FRAME_FULL(offset, locals_, stack):
+    return ("full", offset, list(locals_), list(stack))
+
+
+def FRAME_RAW(offset, data):
+    """Pre-encoded frame bytes (negative tests); ``offset`` is only used
+    to compute the delta of the *next* frame."""
+    return ("raw", offset, data)
+
+
+def _render_vtype(cp, t):
+    tag = t[0]
+    if tag == "top":
+        return b"\x00"
+    if tag == "int":
+        return b"\x01"
+    if tag == "float":
+        return b"\x02"
+    if tag == "double":
+        return b"\x03"
+    if tag == "long":
+        return b"\x04"
+    if tag == "null":
+        return b"\x05"
+    if tag == "uninit_this":
+        return b"\x06"
+    if tag == "object":
+        return b"\x07" + struct.pack(">H", cp.class_(t[1]))
+    if tag == "object_idx":
+        return b"\x07" + struct.pack(">H", t[1])
+    if tag == "uninit":
+        return b"\x08" + struct.pack(">H", t[1])
+    raise ValueError("unknown verification type %r" % (t,))
+
+
+def _render_stack_map(cp, frames):
+    out = struct.pack(">H", len(frames))
+    previous = -1
+    for fr in frames:
+        kind = fr[0]
+        offset = fr[1]
+        delta = offset - previous - 1
+        previous = offset
+        if kind == "same":
+            if not 0 <= delta <= 63:
+                raise ValueError("same_frame delta out of compact range")
+            out += bytes([delta])
+        elif kind == "same_1":
+            if not 0 <= delta <= 63:
+                raise ValueError("same_locals_1 delta out of compact range")
+            out += bytes([64 + delta]) + _render_vtype(cp, fr[2])
+        elif kind == "same_1x":
+            out += bytes([247]) + struct.pack(">H", delta) \
+                + _render_vtype(cp, fr[2])
+        elif kind == "chop":
+            if not 1 <= fr[2] <= 3:
+                raise ValueError("chop_frame count must be 1..3")
+            out += bytes([251 - fr[2]]) + struct.pack(">H", delta)
+        elif kind == "same_x":
+            out += bytes([251]) + struct.pack(">H", delta)
+        elif kind == "append":
+            vts = fr[2]
+            if not 1 <= len(vts) <= 3:
+                raise ValueError("append_frame count must be 1..3")
+            out += bytes([251 + len(vts)]) + struct.pack(">H", delta)
+            out += b"".join(_render_vtype(cp, t) for t in vts)
+        elif kind == "full":
+            out += bytes([255]) + struct.pack(">H", delta)
+            out += struct.pack(">H", len(fr[2]))
+            out += b"".join(_render_vtype(cp, t) for t in fr[2])
+            out += struct.pack(">H", len(fr[3]))
+            out += b"".join(_render_vtype(cp, t) for t in fr[3])
+        elif kind == "raw":
+            out += fr[2]
+        else:
+            raise ValueError("unknown frame kind %r" % (kind,))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Canonical fixtures
+# ---------------------------------------------------------------------------
+
+_OBJ = "java/lang/Object"
+_EX = "java/lang/Exception"
+
+
+def build_handler_frame_class():
+    """The javac-style class from the review request.
+
+    A static ()V method whose protected region constructs an Object and
+    then returns normally; the java/lang/Exception handler stores the
+    caught reference in a local and returns. The Code attribute carries a
+    StackMapTable with an object-typed same_locals_1_stack_item frame at
+    the handler entry, exactly as a standard JVM compiler emits it:
+
+        0: new java/lang/Object
+        3: dup
+        4: invokespecial java/lang/Object.<init>()V
+        7: astore_0
+        8: goto 12
+       11: astore_1            <- handler, frame: stack=[Exception]
+       12: return              <- frame: same
+       Exception table: [0, 8) -> 11, catch java/lang/Exception
+    """
+    b = ClassBuilder(name="Diag")
+    m = b.method()
+    m.label("S")
+    m.new(_OBJ)
+    m.dup()
+    m.invokespecial_init(_OBJ)
+    m.astore(0)
+    m.label("E")
+    m.goto("end")
+    m.label("H")
+    m.astore(1)
+    m.label("end")
+    m.return_()
+    m.catch("S", "E", "H", _EX)
+    m.stack_map([
+        FRAME_SAME_1(m.labels["H"], VT_OBJECT(_EX)),
+        FRAME_SAME(m.labels["end"]),
+    ])
+    return b.build()

@@ -31,12 +31,34 @@ def run_unit_tests():
     return True
 
 
+def _check_handler_frame_report(report):
+    """Shared assertions for the legal javac-style class: the protected
+    region constructs an Object, the handler entry carries exactly one
+    java/lang/Exception reference, and the declared frames are reported."""
+    rows = {o["pc"]: o for o in report["offsets"]}
+    init_row = next(o for o in report["offsets"]
+                    if o["mnemonic"] == "invokespecial")
+    assert init_row["stack_in"] == [
+        "uninitialized(new@0:java/lang/Object)",
+        "uninitialized(new@0:java/lang/Object)"], init_row
+    handlers = report["exception_handlers"]
+    assert len(handlers) == 1, handlers
+    h = handlers[0]
+    assert h["reachable"] and h["entry_stack"] == ["java/lang/Exception"], h
+    assert h["entry_locals"][0] == "top", h
+    assert rows[h["handler_pc"]]["stack_in"] == ["java/lang/Exception"]
+    frames = report["stack_map_frames"]
+    assert any(f["offset"] == h["handler_pc"]
+               and f["stack"] == ["java/lang/Exception"] for f in frames), \
+        frames
+
+
 def run_inprocess_api_smoke():
     print("== [2/3] in-process API smoke ==", flush=True)
     sys.path.insert(0, os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))))
     import base64
-    from tests.classkit import ClassBuilder
+    from tests.classkit import ClassBuilder, build_handler_frame_class
     from app import api
 
     # Legal construction path must pass.
@@ -51,6 +73,13 @@ def run_inprocess_api_smoke():
     r = api.run_review(good, "verify")
     assert r["result"] == "pass", r
     assert r["report"]["offsets"][-1]["mnemonic"] == "return"
+
+    # The legal compiler-generated class with an object-typed handler
+    # frame must pass and report the handler entry state.
+    r = api.run_review(
+        base64.b64encode(build_handler_frame_class()).decode(), "verify")
+    assert r["result"] == "pass", r
+    _check_handler_frame_report(r["report"])
 
     # Half-built object on athrow must be rejected at the athrow pc.
     b2 = ClassBuilder()
@@ -93,7 +122,7 @@ def run_http_smoke(url, timeout=30.0):
     assert "第三方诊断类" in page, "review page marker missing"
 
     import base64
-    from tests.classkit import ClassBuilder
+    from tests.classkit import ClassBuilder, build_handler_frame_class
     b = ClassBuilder()
     m = b.method()
     m.label("S")
@@ -116,6 +145,19 @@ def run_http_smoke(url, timeout=30.0):
     assert result["result"] == "pass", result
     h = result["report"]["exception_handlers"][0]
     assert h["entry_stack"] == ["java/lang/Exception"], h
+
+    # The legal compiler-generated class with an object-typed handler
+    # frame must pass over the real HTTP interface as well.
+    payload = json.dumps({
+        "class_base64": base64.b64encode(
+            build_handler_frame_class()).decode()}).encode()
+    req = urllib.request.Request(
+        url + "/api/verify", data=payload,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        result = json.loads(resp.read().decode())
+    assert result["result"] == "pass", result
+    _check_handler_frame_report(result["report"])
     print("HTTP smoke: PASS", flush=True)
     return True
 

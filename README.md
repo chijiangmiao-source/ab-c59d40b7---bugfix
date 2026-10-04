@@ -6,6 +6,9 @@
 
 - 目标静态 `()V` 方法的**逐偏移**指令、入栈状态（底→顶）、栈高、局部变量；
 - **异常处理器入口状态**（入口栈与清洗后的局部变量）；
+- **StackMapTable 帧**（若存在）：完整解析紧凑/扩展/追加/裁剪/完整五种
+  帧形式与全部验证类型（基本值、对象、空值、未初始化对象），并核对帧偏移
+  落在真实指令边界、帧内容与工作队列传播结果一致；
 - **通过**结论，或**首个拒绝证据**（阶段 + 稳定字节偏移 + 原因）。
 
 ## 安全策略（半初始化对象）
@@ -31,12 +34,26 @@
 整数与浮点运算、`dup*`/`pop*`/`swap` 等。无字段访问、无 category-2（long/double）、
 无子例程（jsr/ret）、无非 void 返回、无其它 invoke。
 
+## StackMapTable 复核
+
+标准 JVM 编译器为含异常处理器/分支汇合的方法生成 `StackMapTable` 属性。
+解析阶段完整解码五种帧形式（same、same_locals_1_stack_item 及其扩展形式、
+append、chop、full）与验证类型标记 0–8（Top/Integer/Float/Double/Long/Null/
+UninitializedThis/Object/Uninitialized）；Object 项的常量池引用必须指向
+`CONSTANT_Class`，Uninitialized 项的偏移必须指向一条真实 `new` 指令。
+验证阶段展开帧（目标方法为静态 `()V`，隐式初始帧无局部变量），检查帧偏移
+落在指令边界，并在工作队列收敛后逐槽核对帧声明与传播结果一致（栈高一致、
+声明类型可容纳推断类型；声明 `top` 的槽位不受约束）。不可达偏移处的帧只做
+结构检查。
+
 ## 稳定定位的拒绝
 
 截断（含截断属性）、非法 magic、跳入指令中部、处理器范围非法（`start>=end`、
 越界、边界/handler_pc 不在指令起点）、栈高下溢/不一致、类型冲突、未初始化
-对象逃逸、工作队列不收敛——全部带字节偏移（解析阶段为 class 文件偏移，
-验证阶段为 Code 内 pc）。服务无状态，每次提交重新解析验证，旧结论不残留。
+对象逃逸、非法栈映射帧（保留帧型、未知验证类型、无效常量池引用、无效
+未初始化偏移、帧偏移不在指令起点、帧声明与推断状态冲突）、工作队列不收敛——
+全部带字节偏移（解析阶段为 class 文件偏移，验证阶段为 Code 内 pc）。
+服务无状态，每次提交重新解析验证，旧结论不残留。
 
 ## 本地运行（无第三方依赖，Python 3.11+ 标准库）
 
@@ -74,12 +91,12 @@ echo $?   # 0 = 全部通过
 ## 布局
 
 ```
-app/classfile.py   常量池/Code 严格解析（截断偏移）
+app/classfile.py   常量池/Code/StackMapTable 严格解析（截断偏移）
 app/descriptors.py 描述子解析
-app/verifier.py    指令解码 + 工作队列数据流（正常边/异常边）
+app/verifier.py    指令解码 + 工作队列数据流（正常边/异常边）+ 帧一致性核对
 app/api.py         Base64/64KiB 边界与复核入口
 app/server.py      stdlib HTTP 服务
 app/webui.py       复核页
 app/verify.py      一次性 verify 服务入口
-tests/             class 手工构造器与 30 个测试
+tests/             class 手工构造器（含 StackMapTable 帧构造）与测试
 ```

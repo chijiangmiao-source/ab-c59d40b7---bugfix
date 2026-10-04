@@ -39,18 +39,25 @@ TAG_NAMES = {
 
 
 class Reader:
-    def __init__(self, data):
+    def __init__(self, data, base=0):
         self.data = data
         self.pos = 0
         self.n = len(data)
+        # File offset of data[0]; keeps error offsets absolute when parsing
+        # an attribute body copied out of the class file.
+        self.base = base
+
+    def here(self):
+        """Absolute class-file offset of the reader position."""
+        return self.base + self.pos
 
     def _need(self, size):
         if self.pos + size > self.n:
             raise ClassFormatError(
-                self.n,
+                self.base + self.n,
                 "truncated class file",
-                {"needed_at": self.pos, "needed_bytes": size,
-                 "file_size": self.n},
+                {"needed_at": self.base + self.pos, "needed_bytes": size,
+                 "file_size": self.base + self.n},
             )
 
     def u1(self):
@@ -220,14 +227,15 @@ class ExceptionEntry:
 
 class Code:
     def __init__(self, max_stack, max_locals, code_bytes, exception_table,
-                 attrs, raw_length):
+                 attrs, raw_length, stack_map_frames=()):
         self.max_stack = max_stack
         self.max_locals = max_locals
         self.code = code_bytes
         self.exception_table = exception_table
         self.attributes = attrs
-        self.stack_map_offsets = _stack_map_offsets(
-            attrs.get("StackMapTable", []))
+        # Raw (delta-encoded) StackMapTable frames; expanded and checked
+        # by the verifier.
+        self.stack_map_frames = list(stack_map_frames)
         self.raw_length = raw_length  # byte length of the Code attribute
 
 
@@ -318,50 +326,135 @@ class ClassFile:
                 catch_name = self.pool.class_name(catch_idx)
             table.append(ExceptionEntry(start_pc, end_pc, handler_pc,
                                         catch_idx, catch_name))
-        nested = _read_attributes(r, self.pool)
+        nested = _read_attributes(
+            r, self.pool, {"StackMapTable": _parse_stack_map_table})
+        smt = nested.get("StackMapTable", [])
+        if len(smt) > 1:
+            raise ClassFormatError(
+                code_attr_start,
+                "multiple StackMapTable attributes in one Code attribute")
         raw_length = r.pos - code_attr_start
         return Code(max_stack, max_locals, code_bytes, table, nested,
-                    raw_length)
+                    raw_length, smt[0] if smt else ())
 
 
-def _read_attributes(r, pool):
+def _read_attributes(r, pool, parsers=None):
+    """Read attributes; known names are parsed from their body copy.
+
+    ``parsers`` maps an attribute name to ``fn(body_reader, pool)``. The
+    body reader is based at the attribute's absolute file offset so parse
+    errors keep class-file offsets. Unknown attributes stay raw bytes.
+    """
     attrs = {}
     count = r.u2()
     for _ in range(count):
         name = pool.utf8(r.u2())
         length = r.u4()
+        body_start = r.here()
         body = r.bytes(length)
-        attrs.setdefault(name, []).append(body)
+        parser = (parsers or {}).get(name)
+        if parser is not None:
+            value = parser(Reader(body, base=body_start), pool)
+        else:
+            value = body
+        attrs.setdefault(name, []).append(value)
     return attrs
 
 
-def _stack_map_offsets(attributes):
-    offsets = []
-    for data in attributes:
-        r = Reader(data)
-        count = r.u2()
-        previous = -1
-        for _ in range(count):
-            frame_type = r.u1()
-            if frame_type <= 63:
-                delta = frame_type
-            elif 64 <= frame_type <= 127:
-                delta = frame_type - 64
-                item_type = r.u1()
-                if item_type > 6:
-                    raise ClassFormatError(
-                        r.pos - 1, "unsupported StackMapTable stack item",
-                        {"verification_type": item_type})
-            else:
-                raise ClassFormatError(
-                    r.pos - 1, "unsupported StackMapTable frame",
-                    {"frame_type": frame_type})
-            previous += delta + 1
-            offsets.append(previous)
-        if r.pos != r.n:
-            raise ClassFormatError(r.pos, "StackMapTable length mismatch",
-                                   {"length": r.n})
-    return offsets
+# ---------------------------------------------------------------------------
+# StackMapTable (JVMS 4.7.4)
+# ---------------------------------------------------------------------------
+#
+# Verification types are decoded to tuples:
+#   ("top",) ("int",) ("float",) ("double",) ("long",) ("null",)
+#   ("uninit_this",) ("object", class_name) ("uninit", new_offset)
+#
+# Frames are kept in their encoded (delta) form; the verifier expands them
+# against the implicit initial frame of the target static ()V method.
+
+_VERIFICATION_TYPE_TAGS = {
+    0: ("top",), 1: ("int",), 2: ("float",), 3: ("double",), 4: ("long",),
+    5: ("null",), 6: ("uninit_this",),
+}
+
+
+def _read_verification_type(r, pool):
+    at = r.here()
+    tag = r.u1()
+    if tag in _VERIFICATION_TYPE_TAGS:
+        return _VERIFICATION_TYPE_TAGS[tag]
+    if tag == 7:  # Object_variable_info
+        index_at = r.here()
+        index = r.u2()
+        try:
+            name = pool.class_name(index)
+        except ClassFormatError as exc:
+            raise ClassFormatError(
+                index_at,
+                "StackMapTable Object item: %s" % exc.reason,
+                {"constant_index": index})
+        return ("object", name)
+    if tag == 8:  # Uninitialized_variable_info
+        return ("uninit", r.u2())
+    raise ClassFormatError(
+        at, "unknown StackMapTable verification type tag", {"tag": tag})
+
+
+def _parse_stack_map_table(r, pool):
+    """Parse one StackMapTable attribute body (all frame forms)."""
+    count = r.u2()
+    frames = []
+    previous = -1
+    for _ in range(count):
+        at = r.here()
+        frame_type = r.u1()
+        if frame_type <= 63:                       # same_frame
+            delta = frame_type
+            frame = {"kind": "same", "locals": [], "stack": []}
+        elif frame_type <= 127:                    # same_locals_1_stack_item
+            delta = frame_type - 64
+            frame = {"kind": "same_1", "locals": [],
+                     "stack": [_read_verification_type(r, pool)]}
+        elif frame_type == 247:                    # same_locals_1_stack_item_ext
+            delta = r.u2()
+            frame = {"kind": "same_1", "locals": [],
+                     "stack": [_read_verification_type(r, pool)]}
+        elif 248 <= frame_type <= 250:             # chop_frame
+            delta = r.u2()
+            frame = {"kind": "chop", "chop": 251 - frame_type,
+                     "locals": [], "stack": []}
+        elif frame_type == 251:                    # same_frame_extended
+            delta = r.u2()
+            frame = {"kind": "same", "locals": [], "stack": []}
+        elif 252 <= frame_type <= 254:             # append_frame
+            delta = r.u2()
+            n = frame_type - 251
+            frame = {"kind": "append",
+                     "locals": [_read_verification_type(r, pool)
+                                for _ in range(n)],
+                     "stack": []}
+        elif frame_type == 255:                    # full_frame
+            delta = r.u2()
+            n_locals = r.u2()
+            locals_ = [_read_verification_type(r, pool)
+                       for _ in range(n_locals)]
+            n_stack = r.u2()
+            stack = [_read_verification_type(r, pool)
+                     for _ in range(n_stack)]
+            frame = {"kind": "full", "locals": locals_, "stack": stack}
+        else:                                      # 128..246: reserved
+            raise ClassFormatError(
+                at, "reserved StackMapTable frame type",
+                {"frame_type": frame_type})
+        previous += delta + 1
+        frame["offset"] = previous
+        frame["at"] = at
+        frames.append(frame)
+    if r.pos != r.n:
+        raise ClassFormatError(
+            r.here(), "StackMapTable length mismatch",
+            {"declared_length": r.n, "consumed": r.pos})
+    return frames
 
 
 def _skip_attributes(r, pool):

@@ -9,7 +9,12 @@ from app.errors import ClassFormatError, VerifyError
 from app.verifier import verify_method
 from app import api
 
-from tests.classkit import ClassBuilder
+from tests.classkit import (
+    ClassBuilder, build_handler_frame_class,
+    VT_TOP, VT_INT, VT_FLOAT, VT_NULL, VT_OBJECT, VT_OBJECT_IDX, VT_UNINIT,
+    FRAME_SAME, FRAME_SAME_1, FRAME_SAME_1_EXT, FRAME_SAME_EXT,
+    FRAME_CHOP, FRAME_APPEND, FRAME_FULL, FRAME_RAW,
+)
 
 EX = "java/lang/Exception"
 OBJ = "java/lang/Object"
@@ -30,6 +35,14 @@ def expect_reject(data, method="verify"):
     except VerifyError as e:
         return e
     raise AssertionError("expected VerifyError but method passed")
+
+
+def expect_parse_reject(data):
+    try:
+        parse(data)
+    except ClassFormatError as e:
+        return e
+    raise AssertionError("expected ClassFormatError but class parsed")
 
 
 class LegalPathsTests(unittest.TestCase):
@@ -142,6 +155,21 @@ class LegalPathsTests(unittest.TestCase):
         h = rep["exception_handlers"][0]
         self.assertEqual(h["entry_stack"], [EX])
         self.assertEqual(h["entry_locals"][0], "top")
+
+    def test_indexed_load_store_forms(self):
+        # Long-form (index byte) local access, as emitted for slots >= 4.
+        b = ClassBuilder()
+        m = b.method()
+        m.iconst(0)
+        m.u1(0x36); m.u1(4)               # istore 4
+        m.u1(0x15); m.u1(4)               # iload 4
+        m.iconst(1); m.iadd()
+        m.u1(0x36); m.u1(4)               # istore 4
+        m.return_()
+        rep = verify(b.build())
+        self.assertEqual(rep["result"], "pass")
+        row = next(o for o in rep["offsets"] if o["mnemonic"] == "iload")
+        self.assertEqual(row["locals_in"][4], "int")
 
     def test_distinct_initialized_news_merge_to_object(self):
         b = ClassBuilder()
@@ -509,6 +537,296 @@ class UnreachableCodeTests(unittest.TestCase):
         m.iadd()          # underflow, but unreachable -> no type error
         rep = verify(b.build())
         self.assertEqual(rep["result"], "pass")
+
+
+class StackMapTableLegalTests(unittest.TestCase):
+    """Legal classes carrying stack map frames (as emitted by a standard
+    JVM compiler) must load, pass, and agree with the inferred states."""
+
+    def test_javac_handler_frame_class_passes(self):
+        rep = verify(build_handler_frame_class())
+        self.assertEqual(rep["result"], "pass")
+        rows = {o["pc"]: o for o in rep["offsets"]}
+        # Construction path: the new identity is on the stack through
+        # dup/<init>, then becomes an initialized reference.
+        self.assertEqual(rows[3]["stack_in"],
+                         ["uninitialized(new@0:java/lang/Object)"])
+        self.assertEqual(rows[4]["stack_in"],
+                         ["uninitialized(new@0:java/lang/Object)",
+                          "uninitialized(new@0:java/lang/Object)"])
+        self.assertEqual(rows[7]["stack_in"], ["java/lang/Object"])
+        # Handler entry: exactly one java/lang/Exception reference.
+        h = rep["exception_handlers"][0]
+        self.assertEqual(h["handler_pc"], 11)
+        self.assertEqual(h["entry_stack"], [EX])
+        self.assertEqual(h["entry_locals"][0], "top")
+        # The declared frames are reported for review.
+        self.assertEqual(
+            rep["stack_map_frames"],
+            [{"offset": 11, "locals": [], "stack": [EX]},
+             {"offset": 12, "locals": [], "stack": []}])
+
+    def test_javac_handler_frame_class_via_api(self):
+        payload = base64.b64encode(build_handler_frame_class()).decode()
+        r = api.run_review(payload, "verify")
+        self.assertEqual(r["result"], "pass")
+        h = r["report"]["exception_handlers"][0]
+        self.assertEqual(h["entry_stack"], [EX])
+
+    def test_all_frame_forms(self):
+        # Compact same, compact same_locals_1, both extended forms,
+        # append, chop and full frames at real instruction boundaries.
+        b = ClassBuilder()
+        m = b.method()
+        m.iconst(0); m.istore(0)          # local0 = int
+        m.iconst(0); m.istore(1)          # local1 = int
+        m.iconst(0); m.ifeq("A"); m.goto("B")
+        m.label("A"); m.u1(0x00)          # nop
+        m.label("B"); m.iconst(5)
+        m.iconst(0); m.ifeq("C"); m.goto("D")
+        m.label("C"); m.u1(0x00)          # nop
+        m.label("D"); m.pop()
+        m.iconst(0); m.ifeq("E"); m.goto("F")
+        m.label("E"); m.u1(0x00)          # nop
+        m.label("F"); m.iconst(0)
+        m.ifeq("G"); m.goto("H")
+        m.label("G"); m.u1(0x00)          # nop
+        m.label("H"); m.return_()
+        L = m.labels
+        m.stack_map([
+            FRAME_APPEND(L["A"], [VT_INT, VT_INT]),      # append
+            FRAME_SAME_EXT(L["B"]),                      # extended same
+            FRAME_SAME_1(L["C"], VT_INT),                # compact 1-item
+            FRAME_SAME_1_EXT(L["D"], VT_INT),            # extended 1-item
+            FRAME_CHOP(L["E"], 1),                       # chop
+            FRAME_FULL(L["G"], [VT_INT, VT_INT], []),    # full
+            FRAME_SAME(L["H"]),                          # compact same
+        ])
+        rep = verify(b.build())
+        self.assertEqual(rep["result"], "pass")
+        self.assertEqual(len(rep["stack_map_frames"]), 7)
+
+    def test_verification_type_null_in_frame(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.aconst_null(); m.astore(0)      # local0 = null
+        m.iconst(0); m.ifeq("L"); m.goto("M")
+        m.label("L"); m.u1(0x00)
+        m.label("M"); m.return_()
+        m.stack_map([FRAME_FULL(m.labels["L"], [VT_NULL], [])])
+        rep = verify(b.build())
+        self.assertEqual(rep["result"], "pass")
+
+    def test_verification_type_float_on_stack(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.u1(0x0C)                        # fconst_1
+        m.iconst(0); m.ifeq("L"); m.goto("M")
+        m.label("L"); m.u1(0x00)
+        m.label("M"); m.pop(); m.return_()
+        m.stack_map([FRAME_SAME_1(m.labels["L"], VT_FLOAT)])
+        rep = verify(b.build())
+        self.assertEqual(rep["result"], "pass")
+
+    def test_verification_type_uninitialized_matches_new_identity(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.new(OBJ)                        # 0
+        m.iconst(0); m.ifeq("L"); m.goto("M")
+        m.label("L"); m.u1(0x00)
+        m.label("M")
+        m.dup(); m.invokespecial_init(OBJ); m.pop(); m.return_()
+        m.stack_map([FRAME_FULL(m.labels["L"], [], [VT_UNINIT(0)])])
+        rep = verify(b.build())
+        self.assertEqual(rep["result"], "pass")
+
+    def test_verification_type_object_supertype_and_top(self):
+        # Declared java/lang/Object accepts any reference; declared top
+        # leaves a local unconstrained.
+        b = ClassBuilder()
+        m = b.method()
+        m.ldc_string("x"); m.astore(0)    # local0 = java/lang/String
+        m.iconst(0); m.istore(1)          # local1 = int
+        m.iconst(0); m.ifeq("L"); m.goto("M")
+        m.label("L"); m.u1(0x00)
+        m.label("M"); m.return_()
+        m.stack_map([
+            FRAME_FULL(m.labels["L"], [VT_OBJECT(OBJ), VT_TOP], []),
+        ])
+        rep = verify(b.build())
+        self.assertEqual(rep["result"], "pass")
+
+    def test_frame_in_unreachable_code_not_checked_against_state(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.return_()
+        m.label("dead")
+        m.iconst(1); m.pop()
+        # Structurally fine, but the declared stack could never hold here;
+        # unreachable code carries no propagated state to disagree with.
+        m.stack_map([
+            FRAME_FULL(m.labels["dead"], [], [VT_INT, VT_INT, VT_INT]),
+        ])
+        rep = verify(b.build())
+        self.assertEqual(rep["result"], "pass")
+
+
+class StackMapTableRejectionTests(unittest.TestCase):
+    """Malformed or lying stack map frames must be rejected with stable,
+    locatable evidence."""
+
+    def _construction(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.new(OBJ); m.dup(); m.invokespecial_init(OBJ)
+        m.pop(); m.return_()
+        return b, m
+
+    def test_frame_offset_into_instruction_middle(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.bipush(0)                       # pcs 0..1
+        m.pop(); m.return_()
+        m.stack_map([FRAME_SAME(1)])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, 1)
+        self.assertIn("instruction boundary", e.reason)
+
+    def test_frame_offset_outside_code(self):
+        b, m = self._construction()
+        m.stack_map([FRAME_SAME_EXT(999)])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, 999)
+        self.assertIn("outside code", e.reason)
+
+    def test_object_item_with_non_class_constant(self):
+        b, m = self._construction()
+        # cp index 1 is a Utf8 entry in this pool, not a Class.
+        m.stack_map([FRAME_SAME_1(8, VT_OBJECT_IDX(1))])
+        e = expect_parse_reject(b.build())
+        self.assertIn("Object item", e.reason)
+        self.assertGreater(e.offset, 0)
+
+    def test_object_item_with_out_of_range_constant(self):
+        b, m = self._construction()
+        m.stack_map([FRAME_SAME_1(8, VT_OBJECT_IDX(9999))])
+        e = expect_parse_reject(b.build())
+        self.assertIn("Object item", e.reason)
+
+    def test_uninitialized_offset_not_at_new(self):
+        b, m = self._construction()
+        # pc 3 is the dup, not a new.
+        m.stack_map([FRAME_FULL(8, [], [VT_UNINIT(3)])])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, 8)
+        self.assertIn("uninitialized", e.reason)
+        self.assertEqual(e.detail["uninitialized_offset"], 3)
+
+    def test_uninitialized_offset_outside_code(self):
+        b, m = self._construction()
+        m.stack_map([FRAME_FULL(8, [], [VT_UNINIT(999)])])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, 8)
+        self.assertIn("uninitialized", e.reason)
+
+    def test_truncated_stack_map_attribute(self):
+        data = build_handler_frame_class()
+        # Cut inside the StackMapTable body (it ends 2 bytes before the
+        # class-attribute count at EOF).
+        e = expect_parse_reject(data[:-5])
+        self.assertIn("truncated", e.reason)
+        self.assertIsInstance(e.offset, int)
+
+    def test_reserved_frame_type(self):
+        b, m = self._construction()
+        m.stack_map([FRAME_RAW(0, bytes([200, 0x00, 0x00]))])
+        e = expect_parse_reject(b.build())
+        self.assertIn("reserved", e.reason)
+
+    def test_unknown_verification_type_tag(self):
+        b, m = self._construction()
+        # same_locals_1_stack_item_frame with bogus item tag 9.
+        m.stack_map([FRAME_RAW(0, bytes([64, 9]))])
+        e = expect_parse_reject(b.build())
+        self.assertIn("verification type", e.reason)
+
+    def test_stack_map_trailing_bytes(self):
+        b, m = self._construction()
+        # One declared frame but extra garbage after it.
+        m.stack_map([FRAME_RAW(0, b"\x00\xff")])
+        e = expect_parse_reject(b.build())
+        self.assertIn("length mismatch", e.reason)
+
+    def test_frame_stack_height_conflicts_with_inference(self):
+        b, m = self._construction()
+        # At pc 7 (pop) the inferred stack holds the initialized ref.
+        m.stack_map([FRAME_FULL(7, [], [])])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, 7)
+        self.assertIn("stack height", e.reason)
+
+    def test_frame_claims_initialized_where_uninitialized_flows(self):
+        # The frame lies about a half-built object: inference carries
+        # uninitialized(new@0) into pc 8, the frame claims a reference.
+        b = ClassBuilder()
+        m = b.method()
+        m.new(OBJ)                        # 0
+        m.iconst(0)                       # 3
+        m.ifeq("L")                       # 4
+        m.u1(0x00)                        # 7: nop (fall-through)
+        m.label("L")                      # 8
+        m.pop(); m.return_()
+        m.stack_map([FRAME_FULL(m.labels["L"], [], [VT_OBJECT(OBJ)])])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, m.labels["L"])
+        self.assertIn("disagrees", e.reason)
+        self.assertIn("uninitialized", e.detail["inferred"])
+
+    def test_frame_claims_uninitialized_where_initialized_flows(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.new(OBJ); m.dup(); m.invokespecial_init(OBJ)   # 0,3,4
+        m.iconst(0)                     # 7
+        m.ifeq("L")                     # 8
+        m.u1(0x00)                      # 11: nop
+        m.label("L")                    # 12
+        m.pop(); m.return_()
+        m.stack_map([FRAME_FULL(m.labels["L"], [], [VT_UNINIT(0)])])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, m.labels["L"])
+        self.assertIn("disagrees", e.reason)
+
+    def test_frame_local_type_mismatch(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.u1(0x0B)                        # fconst_0
+        m.u1(0x38); m.u1(0)               # fstore 0 -> local0 = float
+        m.iconst(0); m.ifeq("L"); m.goto("M")
+        m.label("L"); m.u1(0x00)
+        m.label("M"); m.return_()
+        m.stack_map([FRAME_FULL(m.labels["L"], [VT_INT], [])])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, m.labels["L"])
+        self.assertIn("disagrees", e.reason)
+        self.assertEqual(e.detail["where"], "local")
+
+    def test_chop_more_locals_than_declared(self):
+        b, m = self._construction()
+        m.stack_map([FRAME_CHOP(0, 1)])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, 0)
+        self.assertIn("chop", e.reason)
+
+    def test_frame_declares_more_locals_than_max_locals(self):
+        b = ClassBuilder()
+        m = b.method()
+        m.max_locals = 1
+        m.iconst(0); m.istore(0)
+        m.label("R"); m.return_()
+        m.stack_map([FRAME_FULL(m.labels["R"], [VT_INT, VT_INT], [])])
+        e = expect_reject(b.build())
+        self.assertEqual(e.pc, m.labels["R"])
+        self.assertIn("max_locals", e.reason)
 
 
 if __name__ == "__main__":

@@ -26,10 +26,10 @@ from .descriptors import parse_method_descriptor, slot_count
 # ---------------------------------------------------------------------------
 
 # Format: opcode -> (mnemonic, operand layout)
-# Layouts: "" (none), "b" (u1), "s" (u2), "c1" (u1 cp index),
-#          "c2" (u2 cp index), "br2", "br4", "switch", "wide",
-#          "iface" (u2 cpi,u1 count,u1 0), "idyn" (u2 cpi,u2 0),
-#          "multi" (u2 cpi,u1 dims)
+# Layouts: "" (none), "b" (u1), "lv" (u1 local index), "s" (u2),
+#          "c1" (u1 cp index), "c2" (u2 cp index), "br2", "br4",
+#          "switch", "wide", "iface" (u2 cpi,u1 count,u1 0),
+#          "idyn" (u2 cpi,u2 0), "multi" (u2 cpi,u1 dims)
 OPCODES = {
     0x00: ("nop", ""), 0x01: ("aconst_null", ""),
     0x02: ("iconst_m1", ""), 0x03: ("iconst_0", ""),
@@ -41,8 +41,8 @@ OPCODES = {
     0x0E: ("dconst_0", "X"), 0x0F: ("dconst_1", "X"),
     0x10: ("bipush", "b"), 0x11: ("sipush", "s"),
     0x12: ("ldc", "c1"), 0x13: ("ldc_w", "c2"), 0x14: ("ldc2_w", "X"),
-    0x15: ("iload", "b"), 0x16: ("lload", "X"), 0x17: ("fload", "b"),
-    0x18: ("dload", "X"), 0x19: ("aload", "b"),
+    0x15: ("iload", "lv"), 0x16: ("lload", "X"), 0x17: ("fload", "lv"),
+    0x18: ("dload", "X"), 0x19: ("aload", "lv"),
     0x1A: ("iload_0", ""), 0x1B: ("iload_1", ""),
     0x1C: ("iload_2", ""), 0x1D: ("iload_3", ""),
     0x1E: ("lload_0", "X"), 0x1F: ("lload_1", "X"),
@@ -57,9 +57,9 @@ OPCODES = {
     0x30: ("faload", ""), 0x31: ("daload", "X"),
     0x32: ("aaload", ""), 0x33: ("baload", ""),
     0x34: ("caload", ""), 0x35: ("saload", ""),
-    0x36: ("istore", "b"), 0x37: ("lstore", "X"),
-    0x38: ("fstore", "b"), 0x39: ("dstore", "X"),
-    0x3A: ("astore", "b"),
+    0x36: ("istore", "lv"), 0x37: ("lstore", "X"),
+    0x38: ("fstore", "lv"), 0x39: ("dstore", "X"),
+    0x3A: ("astore", "lv"),
     0x3B: ("istore_0", ""), 0x3C: ("istore_1", ""),
     0x3D: ("istore_2", ""), 0x3E: ("istore_3", ""),
     0x3F: ("lstore_0", "X"), 0x40: ("lstore_1", "X"),
@@ -267,6 +267,8 @@ def decode_instructions(code):
             pass
         elif layout == "b":
             need(1); operands["value"] = code[pc]; pc += 1
+        elif layout == "lv":
+            need(1); operands["index"] = code[pc]; pc += 1
         elif layout == "s":
             need(2)
             operands["value"] = _s16((code[pc] << 8) | code[pc + 1])
@@ -440,16 +442,153 @@ def validate_exception_table(code, table, instr_pcs):
                                "code_length": n})
 
 
-def validate_stack_map_offsets(offsets, instr_pcs, code_length):
-    for offset in offsets:
-        if offset < 0 or offset >= code_length:
+def validate_stack_map_frames(frames, instr_pcs, code_length, instrs):
+    """Structural checks on expanded StackMapTable frames."""
+    for fr in frames:
+        if fr.offset < 0 or fr.offset >= code_length:
             raise VerifyError(
-                offset, "StackMapTable frame offset outside code",
-                {"frame_offset": offset, "code_length": code_length})
-        if offset not in instr_pcs:
+                fr.offset, "StackMapTable frame offset outside code",
+                {"frame_offset": fr.offset, "code_length": code_length})
+        if fr.offset not in instr_pcs:
             raise VerifyError(
-                offset, "StackMapTable frame is not at an instruction boundary",
-                {"frame_offset": offset})
+                fr.offset,
+                "StackMapTable frame is not at an instruction boundary",
+                {"frame_offset": fr.offset})
+        for t in fr.locals + fr.stack:
+            if t[0] == "uninit":
+                off = t[1]
+                if off not in instr_pcs or \
+                        instrs[off].mnemonic != "new":
+                    raise VerifyError(
+                        fr.offset,
+                        "StackMapTable uninitialized type does not "
+                        "reference a new instruction",
+                        {"uninitialized_offset": off})
+
+
+class StackMapFrame:
+    """One expanded frame: full locals/stack snapshot at ``offset``."""
+    __slots__ = ("offset", "locals", "stack", "at")
+
+    def __init__(self, offset, locals_, stack, at):
+        self.offset = offset
+        self.locals = locals_
+        self.stack = stack
+        self.at = at  # class-file offset of the frame_type byte
+
+
+def expand_stack_map(raw_frames, max_locals):
+    """Expand delta-encoded frames against the implicit initial frame.
+
+    The target method is static ()V, so the implicit initial frame has no
+    locals and an empty stack (JVMS 4.10.1.6: the initial frame covers the
+    method's declared parameter types only).
+    """
+    frames = []
+    locals_ = []
+    for raw in raw_frames:
+        kind = raw["kind"]
+        if kind == "same":
+            stack = []
+        elif kind == "same_1":
+            stack = list(raw["stack"])
+        elif kind == "chop":
+            k = raw["chop"]
+            if k > len(locals_):
+                raise VerifyError(
+                    raw["offset"],
+                    "StackMapTable chop frame removes more locals than "
+                    "the previous frame declares",
+                    {"chop": k, "previous_locals": len(locals_)})
+            locals_ = locals_[:len(locals_) - k]
+            stack = []
+        elif kind == "append":
+            locals_ = locals_ + list(raw["locals"])
+            stack = []
+        else:  # full
+            locals_ = list(raw["locals"])
+            stack = list(raw["stack"])
+        if len(locals_) > max_locals:
+            raise VerifyError(
+                raw["offset"],
+                "StackMapTable frame declares more locals than max_locals",
+                {"frame_locals": len(locals_), "max_locals": max_locals})
+        frames.append(StackMapFrame(raw["offset"], list(locals_),
+                                    list(stack), raw["at"]))
+    return frames
+
+
+def vtype_str(t):
+    """Display form of a declared StackMapTable verification type."""
+    tag = t[0]
+    if tag == "object":
+        return t[1]
+    if tag == "uninit":
+        return "uninitialized(new@%d)" % t[1]
+    if tag == "uninit_this":
+        return "uninitializedThis"
+    return tag
+
+
+def _declared_accepts(decl, actual):
+    """True when the inferred type ``actual`` is assignable to the type
+    ``decl`` claimed by a stack map frame (no class hierarchy available,
+    so distinct reference types can never be proven assignable)."""
+    tag = decl[0]
+    if tag == "top":
+        return True  # the frame leaves this slot unconstrained
+    if tag in ("int", "float"):
+        return actual == decl
+    if tag in ("double", "long"):
+        return False  # category-2 values are outside the supported subset
+    if tag == "null":
+        return actual == NULL
+    if tag == "uninit_this":
+        return False  # a static ()V method never holds uninitializedThis
+    if tag == "object":
+        if actual == NULL:
+            return True
+        return actual[0] == "ref" and \
+            (actual[1] == decl[1] or decl[1] == "java/lang/Object")
+    if tag == "uninit":
+        return actual[0] == "uninit" and actual[1] == decl[1]
+    return False  # pragma: no cover - parser rejects unknown tags
+
+
+def check_stack_map_consistency(frames, states, max_locals):
+    """Every frame at a reachable pc must agree with the type state the
+    work queue actually propagated there."""
+    for fr in frames:
+        state = states.get(fr.offset)
+        if state is None:
+            continue  # unreachable code carries no propagated state
+        if len(fr.stack) != len(state.stack):
+            raise VerifyError(
+                fr.offset,
+                "StackMapTable frame stack height does not match the "
+                "inferred state",
+                {"frame_height": len(fr.stack),
+                 "inferred_height": len(state.stack)})
+        for i, (decl, actual) in enumerate(zip(fr.stack, state.stack)):
+            if not _declared_accepts(decl, actual):
+                raise VerifyError(
+                    fr.offset,
+                    "StackMapTable stack slot disagrees with the "
+                    "inferred state",
+                    {"slot": i, "where": "stack",
+                     "declared": vtype_str(decl),
+                     "inferred": type_str(actual)})
+        declared_locals = list(fr.locals) + \
+            [("top",)] * (max_locals - len(fr.locals))
+        for i in range(max_locals):
+            if not _declared_accepts(declared_locals[i], state.locals[i]):
+                raise VerifyError(
+                    fr.offset,
+                    "StackMapTable local slot disagrees with the "
+                    "inferred state",
+                    {"slot": i, "where": "local",
+                     "declared": vtype_str(declared_locals[i]),
+                     "inferred": type_str(state.locals[i])})
 
 
 def verify_method(cf, method_name):
@@ -465,7 +604,9 @@ def verify_method(cf, method_name):
     instrs = decode_instructions(code)
     pcs = set(instrs)
     validate_exception_table(code, code_obj.exception_table, pcs)
-    validate_stack_map_offsets(code_obj.stack_map_offsets, pcs, len(code))
+    smap_frames = expand_stack_map(code_obj.stack_map_frames,
+                                   code_obj.max_locals)
+    validate_stack_map_frames(smap_frames, pcs, len(code), instrs)
 
     # All explicit control-flow targets must land on instruction starts.
     for ins in instrs.values():
@@ -598,7 +739,9 @@ def verify_method(cf, method_name):
             guard_backward(t, out, pc)
             push_state(t, out, pc)
 
-    return build_report(cf, method, code_obj, instrs, states)
+    check_stack_map_consistency(smap_frames, states, max_locals)
+
+    return build_report(cf, method, code_obj, instrs, states, smap_frames)
 
 
 def _select_method(cf, name):
@@ -1004,7 +1147,7 @@ def _do_invokespecial_init(pc, ins, st, lv, cf):
 # Report
 # ---------------------------------------------------------------------------
 
-def build_report(cf, method, code_obj, instrs, states):
+def build_report(cf, method, code_obj, instrs, states, smap_frames=()):
     offsets = []
     for pc in sorted(instrs):
         ins = instrs[pc]
@@ -1078,6 +1221,12 @@ def build_report(cf, method, code_obj, instrs, states):
         "instruction_count": len(instrs),
         "offsets": offsets,
         "exception_handlers": handler_entries,
+        "stack_map_frames": [
+            {"offset": fr.offset,
+             "locals": [vtype_str(t) for t in fr.locals],
+             "stack": [vtype_str(t) for t in fr.stack]}
+            for fr in smap_frames
+        ],
     }
 
 

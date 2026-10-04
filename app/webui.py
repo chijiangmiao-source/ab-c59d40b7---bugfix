@@ -178,6 +178,19 @@ function renderReport(r) {
   }
   hh += '</tbody></table></div>';
   extra.insertAdjacentHTML('beforeend', hh);
+
+  if (r.stack_map_frames && r.stack_map_frames.length) {
+    let sf = '<h2 style="border-top:1px solid var(--line)">StackMapTable 帧（已核对）</h2>';
+    sf += '<div class="pad"><table><thead><tr><th>pc</th>'
+        + '<th>声明局部变量</th><th>声明栈</th></tr></thead><tbody>';
+    for (const f of r.stack_map_frames) {
+      sf += '<tr><td class="pc">' + f.offset + '</td><td>'
+        + typeList(f.locals) + '</td><td>' + typeList(f.stack)
+        + '</td></tr>';
+    }
+    sf += '</tbody></table></div>';
+    extra.insertAdjacentHTML('beforeend', sf);
+  }
 }
 
 goBtn.addEventListener('click', async () => {
