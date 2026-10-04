@@ -31,9 +31,29 @@
 整数与浮点运算、`dup*`/`pop*`/`swap` 等。无字段访问、无 category-2（long/double）、
 无子例程（jsr/ret）、无非 void 返回、无其它 invoke。
 
+### StackMapTable（栈映射帧）
+
+Code 属性中的 `StackMapTable` 被**完整解析并参与验证**，覆盖标准 JVM 编译器
+生成的全部帧形式与验证类型：
+
+- 帧形式：紧凑（`same_frame`、`same_locals_1_stack_item_frame`）、扩展
+  （`same_frame_extended`、`same_locals_1_stack_item_frame_extended`）、
+  追加（`append_frame`）、裁剪（`chop_frame`）与完整（`full_frame`）。
+- 验证类型：Top / Integer / Float / Null / Object / Uninitialized；
+  category-2（Long/Double）与 UninitializedThis 在静态 `()V` 子集中拒绝。
+- 每个帧的偏移必须落在**真实指令起点**；`Uninitialized_variable_info`
+  必须指向一条 `new` 指令；帧声明的局部变量/栈必须与工作队列沿正常边和
+  异常边传播到该偏移的类型状态逐槽兼容，帧本身作为该偏移的权威类型状态
+  继续向下游传播。
+- 处理器入口的对象引用型帧（`Object_variable_info`，如 javac 为
+  `catch(Exception)` 生成的 `same_locals_1_stack_item_frame`）正常接受；
+  解析阶段不再拒绝这类合法 class。
+
 ## 稳定定位的拒绝
 
-截断（含截断属性）、非法 magic、跳入指令中部、处理器范围非法（`start>=end`、
+截断（含截断属性/截断栈映射帧）、非法 magic、**栈映射帧非法**（保留帧型、
+无效常量池引用、无效未初始化偏移、帧跳入指令中部、声明类型/栈高与传播结果
+冲突、活跃栈槽声明为 Top）、跳入指令中部、处理器范围非法（`start>=end`、
 越界、边界/handler_pc 不在指令起点）、栈高下溢/不一致、类型冲突、未初始化
 对象逃逸、工作队列不收敛——全部带字节偏移（解析阶段为 class 文件偏移，
 验证阶段为 Code 内 pc）。服务无状态，每次提交重新解析验证，旧结论不残留。
@@ -74,12 +94,12 @@ echo $?   # 0 = 全部通过
 ## 布局
 
 ```
-app/classfile.py   常量池/Code 严格解析（截断偏移）
+app/classfile.py   常量池/Code/StackMapTable 严格解析（截断偏移）
 app/descriptors.py 描述子解析
-app/verifier.py    指令解码 + 工作队列数据流（正常边/异常边）
+app/verifier.py    指令解码 + 工作队列数据流（正常边/异常边 + 栈映射帧核对）
 app/api.py         Base64/64KiB 边界与复核入口
 app/server.py      stdlib HTTP 服务
 app/webui.py       复核页
-app/verify.py      一次性 verify 服务入口
-tests/             class 手工构造器与 30 个测试
+app/verify.py      一次性 verify 服务入口（单元测试 + 验收语料）
+tests/             class 手工构造器与 62 个测试
 ```

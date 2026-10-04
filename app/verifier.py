@@ -18,7 +18,7 @@ style). Safety policy enforced on top of the JVM rules:
 
 from collections import deque
 
-from .errors import VerifyError
+from .errors import ClassFormatError, VerifyError
 from .descriptors import parse_method_descriptor, slot_count
 
 # ---------------------------------------------------------------------------
@@ -440,16 +440,149 @@ def validate_exception_table(code, table, instr_pcs):
                                "code_length": n})
 
 
-def validate_stack_map_offsets(offsets, instr_pcs, code_length):
-    for offset in offsets:
+def load_stack_map_frames(cf, code_obj, instrs, code_length):
+    """Resolve the parse-time StackMapTable frames to bytecode pcs.
+
+    Takes the frames already strictly decoded at class-parse time
+    (compact/extended/chop/append/full forms), computes absolute bytecode
+    offsets from the offset deltas, and validates them against the
+    instruction layout.
+
+    Raises VerifyError (bytecode pc) for frames not on an instruction
+    boundary or carrying an illegal Uninitialized_variable_info offset.
+    """
+    instr_pcs = set(instrs)
+    result = []
+    offset = -1
+    for fr in code_obj.stack_map_frames:
+        offset += fr.offset_delta + 1
         if offset < 0 or offset >= code_length:
             raise VerifyError(
-                offset, "StackMapTable frame offset outside code",
-                {"frame_offset": offset, "code_length": code_length})
+                offset if offset >= 0 else 0,
+                "StackMapTable frame offset outside code",
+                {"frame_offset": offset,
+                 "code_length": code_length})
         if offset not in instr_pcs:
             raise VerifyError(
-                offset, "StackMapTable frame is not at an instruction boundary",
+                offset,
+                "StackMapTable frame is not at an instruction boundary",
                 {"frame_offset": offset})
+        for slot, t in enumerate(fr.locals):
+            if t[0] == "uninit":
+                cls = _check_uninit_offset(
+                    t[1], offset, instrs, cf, code_length, "local")
+                fr.locals[slot] = ("uninit", t[1], cls)
+        for slot, t in enumerate(fr.stack):
+            if t[0] == "uninit":
+                cls = _check_uninit_offset(
+                    t[1], offset, instrs, cf, code_length, "stack")
+                fr.stack[slot] = ("uninit", t[1], cls)
+        fr.pc = offset
+        result.append(fr)
+    return result
+
+
+def _check_uninit_offset(new_pc, frame_pc, instrs, cf, code_length, where):
+    """Validate an Uninitialized_variable_info offset; return the class name
+    of the new instruction so the frame carries the same identity shape as
+    propagated ``("uninit", new_pc, class)`` states."""
+    if new_pc >= code_length or new_pc not in instrs:
+        raise VerifyError(
+            frame_pc,
+            "StackMapTable Uninitialized_variable_info offset does not "
+            "name a new instruction",
+            {"new_pc": new_pc, "frame_pc": frame_pc, "where": where})
+    ins = instrs[new_pc]
+    if ins.opcode != 0xBB:
+        raise VerifyError(
+            frame_pc,
+            "StackMapTable Uninitialized_variable_info offset does not "
+            "name a new instruction",
+            {"new_pc": new_pc, "frame_pc": frame_pc, "where": where,
+             "found_mnemonic": ins.mnemonic})
+    return cf.pool.class_name(ins.operands["cp"])
+
+
+def normalize_declared_frame(fr, code_obj):
+    """Convert a parsed stack map frame to (locals, stack) over the verifier
+    type tuples, enforcing the supported-subset restrictions and the
+    Code attribute's max_locals / max_stack bounds.
+
+    The declared frame is an *assertion* written by the producer; it never
+    seeds dataflow on its own. Uninitialized_variable_info becomes
+    ``("uninit", new_pc)`` (identity only); long/double and
+    UninitializedThis have no place in a static ()V method of this subset.
+    """
+    def convert(t, where):
+        kind = t[0]
+        if kind in ("long", "double"):
+            raise VerifyError(
+                fr.pc,
+                "StackMapTable declares a category-2 value (%s) outside "
+                "the supported ()V subset" % kind,
+                {"where": where})
+        if kind == "uninitthis":
+            raise VerifyError(
+                fr.pc,
+                "UninitializedThis_variable_info is illegal in a static "
+                "method", {"where": where})
+        if kind == "uninit":
+            classname = t[2] if len(t) > 2 else None
+            return uninit(t[1], classname)
+        if kind == "top":
+            return TOP
+        if kind == "int":
+            return INT
+        if kind == "float":
+            return FLOAT
+        if kind == "null":
+            return NULL
+        if kind == "ref":
+            return ("ref", t[1])
+        raise VerifyError(fr.pc,
+                          "unknown StackMapTable verification type",
+                          {"where": where, "raw": str(t)})  # pragma: no cover
+
+    loc = [convert(t, "local") for t in fr.locals]
+    if len(loc) > code_obj.max_locals:
+        raise VerifyError(
+            fr.pc, "StackMapTable frame declares more locals than max_locals",
+            {"declared": len(loc), "max_locals": code_obj.max_locals})
+    loc += [TOP] * (code_obj.max_locals - len(loc))
+    stk = [convert(t, "stack") for t in fr.stack]
+    if len(stk) > code_obj.max_stack:
+        raise VerifyError(
+            fr.pc, "StackMapTable frame declares a stack deeper than "
+                   "max_stack",
+            {"declared": len(stk), "max_stack": code_obj.max_stack})
+    return loc, stk
+
+
+def _declared_assignable(declared, actual):
+    """Is the propagated ``actual`` type assignable to a frame-declared type?
+
+    Reference hierarchy reconstruction is intentionally not attempted
+    (widening to any reference type is accepted, matching the merge
+    lattice's conservative java/lang/Object widening); identity of
+    uninitialized objects is exact.
+    """
+    d, a = declared, actual
+    if d[0] == "top":
+        return True
+    if d[0] == "int":
+        return a[0] == "int"
+    if d[0] == "float":
+        return a[0] == "float"
+    if d[0] == "null":
+        return a[0] == "null"
+    if d[0] == "uninit":
+        return a[0] == "uninit" and a[1] == d[1]
+    if d[0] == "ref":
+        # A declared reference accepts an initialized reference or null,
+        # never a half-constructed object (half-built objects escape only
+        # through explicit uninit identities, which are handled above).
+        return a[0] in ("ref", "null")
+    return False  # pragma: no cover
 
 
 def verify_method(cf, method_name):
@@ -465,7 +598,15 @@ def verify_method(cf, method_name):
     instrs = decode_instructions(code)
     pcs = set(instrs)
     validate_exception_table(code, code_obj.exception_table, pcs)
-    validate_stack_map_offsets(code_obj.stack_map_offsets, pcs, len(code))
+    declared_frames = load_stack_map_frames(
+        cf, code_obj, instrs, len(code))
+    declared_by_pc = {}
+    for fr in declared_frames:
+        if fr.pc in declared_by_pc:
+            raise VerifyError(
+                fr.pc, "duplicate StackMapTable frame at one bytecode offset",
+                {"frame_offset": fr.pc})
+        declared_by_pc[fr.pc] = fr
 
     # All explicit control-flow targets must land on instruction starts.
     for ins in instrs.values():
@@ -486,8 +627,56 @@ def verify_method(cf, method_name):
     locals0 = [TOP] * max_locals
     stack0 = []
 
+    # Producer-asserted stack map frames authoritatively define the type
+    # state at their offset: every incoming edge must be assignable to the
+    # declared frame, and propagation continues *from* the declared frame
+    # (JVMS 4.10.1 type checking with StackMapTable).
+    declared_states = {}
+    for pc, fr in declared_by_pc.items():
+        dloc, dstk = normalize_declared_frame(fr, code_obj)
+        declared_states[pc] = Frame(dloc, dstk)
+
     states = {}
     queue = deque()
+
+    def coerce_to_declared(pc, incoming, cause):
+        """Check one incoming edge against the frame declared at ``pc``.
+
+        Returns the authoritative frame to propagate onward; raises
+        VerifyError at ``pc`` on a stack-height or per-slot mismatch.
+        """
+        declared = declared_states.get(pc)
+        if declared is None:
+            return incoming
+        if len(declared.stack) != len(incoming.stack):
+            raise VerifyError(
+                pc, "StackMapTable stack conflicts with propagated stack "
+                    "height",
+                {"frame_pc": pc, "from_pc": cause,
+                 "declared_height": len(declared.stack),
+                 "propagated_height": len(incoming.stack)})
+        for i, (d, a) in enumerate(zip(declared.stack, incoming.stack)):
+            if d[0] == "top":
+                # Top_variable_info is legal for dead locals but can never
+                # name a live operand-stack slot.
+                raise VerifyError(
+                    pc, "StackMapTable declares top for a live operand "
+                        "stack slot",
+                    {"slot": i, "from_pc": cause})
+            if not _declared_assignable(d, a):
+                raise VerifyError(
+                    pc, "StackMapTable stack type conflicts with propagated "
+                        "type state",
+                    {"slot": i, "from_pc": cause,
+                     "declared": type_str(d), "propagated": type_str(a)})
+        for i, (d, a) in enumerate(zip(declared.locals, incoming.locals)):
+            if not _declared_assignable(d, a):
+                raise VerifyError(
+                    pc, "StackMapTable local type conflicts with propagated "
+                        "type state",
+                    {"slot": i, "from_pc": cause,
+                     "declared": type_str(d), "propagated": type_str(a)})
+        return declared
 
     def push_state(pc, frame, cause):
         if pc < 0 or pc >= len(code) or pc not in pcs:
@@ -495,6 +684,7 @@ def verify_method(cf, method_name):
                 pc if 0 <= pc < len(code) else cause,
                 "successor is not at an instruction boundary",
                 {"from_pc": cause, "target_pc": pc})
+        frame = coerce_to_declared(pc, frame, cause)
         if pc not in states:
             states[pc] = frame
             queue.append(pc)
@@ -549,8 +739,9 @@ def verify_method(cf, method_name):
                 "object (a single new may be initialized only once)",
                 {"source_pc": source_pc, "target_pc": target})
 
-    states[0] = Frame(locals0, stack0)
-    queue.append(0)
+    # Method entry; if a frame is declared at offset 0 the initial state is
+    # checked against it exactly like any other incoming edge.
+    push_state(0, Frame(locals0, stack0), 0)
 
     # Defensive convergence bound: the lattice is finite and monotone, so
     # a fixpoint is always reached; this only guards an implementation bug.
@@ -597,6 +788,16 @@ def verify_method(cf, method_name):
         for t in successors:
             guard_backward(t, out, pc)
             push_state(t, out, pc)
+
+    # Every declared frame must actually have been reached by at least one
+    # propagated edge (normal or exception); a frame with no incoming state
+    # cannot be reconciled with the work-queue propagation result.
+    for pc in sorted(declared_by_pc):
+        if pc not in states:
+            raise VerifyError(
+                pc, "StackMapTable frame at an offset the work queue never "
+                    "reached (declared frame with no propagated state)",
+                {"frame_type": declared_by_pc[pc].frame_type})
 
     return build_report(cf, method, code_obj, instrs, states)
 

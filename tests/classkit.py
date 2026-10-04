@@ -8,6 +8,26 @@ from the bytecode. Constant indices are allocated automatically.
 import struct
 
 
+# StackMapTable verification_type_info tags
+VT_TOP = 0
+VT_INTEGER = 1
+VT_FLOAT = 2
+VT_DOUBLE = 3
+VT_LONG = 4
+VT_NULL = 5
+VT_UNINITIALIZED_THIS = 6
+VT_OBJECT = 7
+VT_UNINITIALIZED = 8
+
+
+def vt_object(classname):
+    return ("object", classname)
+
+
+def vt_uninit(pc):
+    return ("uninit", pc)
+
+
 class CPBuilder:
     def __init__(self):
         self._items = []          # list of (key, blob)
@@ -72,6 +92,15 @@ class MethodBuilder:
         self.max_locals = 8
         self._ph = []  # (emitted_pos, width 2|4, label)
         self._switch_ph = []
+        # Stack map entries, added via :meth:`stack_map`; serialized into a
+        # StackMapTable Code attribute after labels are resolved.
+        self.stack_frames = []
+        # Raw override bytes for the StackMapTable attribute (negative
+        # tests); when set, stack_frames is ignored.
+        self.stack_map_raw = None
+        # When True, emit the StackMapTable attribute twice (parse-stage
+        # rejection of duplicate attributes).
+        self.duplicate_stack_map_attr = False
 
     # -- structure ---------------------------------------------------------
     def label(self, name):
@@ -141,6 +170,9 @@ class MethodBuilder:
 
     def pop(self):
         self.u1(0x57)
+
+    def nop(self):
+        self.u1(0x00)
 
     def swap(self):
         self.u1(0x5F)
@@ -212,6 +244,102 @@ class MethodBuilder:
     def ldc_string(self, text):
         self.emit(bytes([0x12, self.cp.string(text)]))
 
+    # -- stack maps --------------------------------------------------------
+    def stack_map(self, label, kind, *, extended=False, items=None,
+                  locals_=None, stack=None, chop=None):
+        """Declare a stack map frame at ``label``.
+
+        ``kind`` is one of ``"same"``, ``"stack"`` (exactly one stack item
+        in ``items``), ``"chop"`` (``chop`` in 1..3), ``"append"``
+        (``items`` lists the appended locals) or ``"full"`` (``locals_``
+        and ``stack`` give the complete frame). ``extended=True`` forces
+        the *_extended encoding for same/stack; chop/append/full are
+        extended forms by definition. Offset deltas are computed from the
+        resolved label positions in emission order.
+        """
+        # Class constant indices referenced by Object_variable_info must
+        # be allocated before the constant pool is rendered (which happens
+        # before the Code attribute bytes are emitted), so resolve them
+        # eagerly at declaration time.
+        def resolve(v):
+            if isinstance(v, tuple) and v and v[0] == "object":
+                return ("oidx", self.cp.class_(v[1]))
+            return v
+
+        items = [resolve(v) for v in (items or [])]
+        locals_ = [resolve(v) for v in (locals_ or [])]
+        stack = [resolve(v) for v in (stack or [])]
+        self.stack_frames.append(
+            dict(label=label, kind=kind, extended=extended, items=items,
+                 locals=locals_, stack=stack, chop=chop))
+
+    def set_stack_map_raw(self, body):
+        """Force a raw StackMapTable attribute body (malformed-attr tests).
+
+        When set, frames added via :meth:`stack_map` are ignored.
+        """
+        self.stack_map_raw = bytes(body)
+
+    def _vt_bytes(self, v):
+        if isinstance(v, int):  # bare singleton tag
+            return bytes([v])
+        if v[0] == "oidx":  # pre-resolved Object_variable_info
+            return bytes([VT_OBJECT]) + struct.pack(">H", v[1])
+        if v[0] == "object":
+            return bytes([VT_OBJECT]) + \
+                struct.pack(">H", self.cp.class_(v[1]))
+        if v[0] == "uninit":
+            return bytes([VT_UNINITIALIZED]) + struct.pack(">H", v[1])
+        raise ValueError("bad verification type descriptor %r" % (v,))
+
+    def serialize_stack_map(self):
+        """Render the StackMapTable attribute body from stack_frames."""
+        out = struct.pack(">H", len(self.stack_frames))
+        prev = -1
+        for fr in self.stack_frames:
+            pc = self.labels[fr["label"]]
+            delta = pc - prev - 1
+            kind = fr["kind"]
+            if kind == "same":
+                if fr["extended"]:
+                    out += bytes([251]) + struct.pack(">H", delta)
+                else:
+                    assert 0 <= delta <= 63
+                    out += bytes([delta])
+            elif kind == "stack":
+                items = fr["items"]
+                assert len(items) == 1
+                body = self._vt_bytes(items[0])
+                if fr["extended"]:
+                    out += bytes([247]) + struct.pack(">H", delta) + body
+                else:
+                    assert 0 <= delta <= 63
+                    out += bytes([64 + delta]) + body
+            elif kind == "chop":
+                k = fr["chop"]
+                assert 1 <= k <= 3
+                out += bytes([251 - k]) + struct.pack(">H", delta)
+            elif kind == "append":
+                items = fr["items"]
+                assert 1 <= len(items) <= 3
+                out += bytes([251 + len(items)]) + struct.pack(">H", delta)
+                for v in items:
+                    out += self._vt_bytes(v)
+            elif kind == "full":
+                out += bytes([255]) + struct.pack(">H", delta)
+                loc = fr["locals"] or []
+                stk = fr["stack"] or []
+                out += struct.pack(">H", len(loc))
+                for v in loc:
+                    out += self._vt_bytes(v)
+                out += struct.pack(">H", len(stk))
+                for v in stk:
+                    out += self._vt_bytes(v)
+            else:
+                raise ValueError("unknown frame kind %r" % kind)
+            prev = pc
+        return out
+
     def _branch2(self, opcode, label):
         pos = len(self.code)
         self.emit(bytes([opcode, 0, 0]))
@@ -237,6 +365,11 @@ class ClassBuilder:
         this_idx = self.cp.class_(self.name)
         super_idx = self.cp.class_(self.super_name)
         code_name = self.cp.utf8("Code")
+        # Allocate the attribute name index before the pool is rendered.
+        if any(m.stack_frames or m.stack_map_raw for m in self.methods):
+            self.smt_name_idx = self.cp.utf8("StackMapTable")
+        else:
+            self.smt_name_idx = None
 
         out = struct.pack(">I", 0xCAFEBABE)
         out += struct.pack(">HH", self.minor, self.major)
@@ -259,6 +392,8 @@ class ClassBuilder:
         return bytes(out)
 
     def _code_attr(self, m):
+        has_smt = bool(m.stack_frames or m.stack_map_raw)
+        attr_count = 2 if (has_smt and m.duplicate_stack_map_attr) else int(has_smt)
         out = struct.pack(">HHI", m.max_stack, m.max_locals, len(m.code))
         out += bytes(m.code)
         out += struct.pack(">H", len(m.exception_table))
@@ -268,5 +403,21 @@ class ClassBuilder:
             else:
                 sp, ep, hp = sl, el, hl
             out += struct.pack(">HHHH", sp, ep, hp, catch_idx)
-        out += struct.pack(">H", 0)
+        out += struct.pack(">H", attr_count)
+
+        def emit_smt(buf):
+            if m.stack_map_raw is not None:
+                buf += struct.pack(">HI", self.smt_name_idx,
+                                   len(m.stack_map_raw))
+                buf += m.stack_map_raw
+            elif m.stack_frames:
+                body = m.serialize_stack_map()
+                buf += struct.pack(">HI", self.smt_name_idx, len(body))
+                buf += body
+            return buf
+
+        if has_smt:
+            out = emit_smt(out)
+            if m.duplicate_stack_map_attr:
+                out = emit_smt(out)
         return out
