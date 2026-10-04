@@ -1,0 +1,30 @@
+services:
+  web:
+    build: .
+    image: diag-verifier:latest
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      # Configurable host port; defaults to 8080.
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import json,urllib.request,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz'))['status']=='ok' else 1)"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+
+  verify:
+    build: .
+    image: diag-verifier:latest
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      WEB_HEALTH_URL: http://web:8080
+    # One-shot: tests + image build check + API/HTTP smoke, then exit with
+    # a status code reporting the result.
+    command: ["python", "-m", "app.verify"]
+    restart: "no"
